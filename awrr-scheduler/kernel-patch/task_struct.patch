@@ -1,0 +1,102 @@
+/*
+ * task_struct.patch - Modifications to include/linux/sched.h
+ *
+ * This patch adds:
+ *   1. Forward declaration of struct sched_awrr_entity
+ *   2. The awrr field embedded in struct task_struct
+ */
+
+/* =====================================================================
+ * CHANGE 1: Forward declaration of sched_awrr_entity
+ *
+ * Location: Near the top of include/linux/sched.h, in the forward
+ *           declarations section, after struct sched_dl_entity.
+ *
+ * Note: The full definition of struct sched_awrr_entity lives in
+ *       kernel/sched/awrr.h. For inclusion in task_struct, the
+ *       struct definition must be visible here. Either:
+ *       (a) Include the full struct definition in this file, or
+ *       (b) Include awrr.h from sched.h.
+ *
+ *       Option (a) is shown below to keep kernel headers self-contained.
+ * ===================================================================== */
+
+// --- ADD THIS STRUCT DEFINITION ---
+// Location: After struct sched_dl_entity definition, before struct task_struct
+
+/*
+ * AWRR scheduling entity - embedded in task_struct.
+ * Contains all per-task state for the Adaptive Weighted Round-Robin
+ * scheduler including behavior metrics, weight, and run queue linkage.
+ */
+struct sched_awrr_entity {
+	struct list_head	run_list;
+
+	unsigned int		weight;
+	unsigned int		pre_boost_weight;
+	unsigned int		penalty_epochs;
+	unsigned int		time_slice;
+
+	u64			exec_start;
+	u64			sum_exec_runtime;
+	u64			prev_sum_exec;
+
+	u64			wait_start;
+	u64			sum_wait_time;
+
+	u64			io_wait_start;
+	u64			sum_io_wait;
+	u64			epoch_io_wait;
+	u64			epoch_exec;
+
+	unsigned int		burst_ratio;
+	unsigned int		yield_freq;
+	unsigned int		io_wait_ratio;
+	unsigned int		behavior_score;
+
+	unsigned int		nr_yields;
+	unsigned int		tick_count;
+	unsigned int		total_ticks;
+	unsigned int		epoch_count;
+
+	unsigned int		starve_boosted;
+	unsigned int		on_rq;
+	unsigned int		initialized;
+};
+
+
+/* =====================================================================
+ * CHANGE 2: Add awrr field to struct task_struct
+ *
+ * Location: After the dl scheduling entity, before context switch
+ *           counters or the scheduling statistics block.
+ *
+ *           In kernel 6.1, the ordering in task_struct is:
+ *             struct sched_entity     se;
+ *             struct sched_rt_entity  rt;
+ *             struct sched_dl_entity  dl;
+ *             << INSERT HERE >>
+ * ===================================================================== */
+
+// --- BEFORE ---
+struct task_struct {
+	/* ... */
+	const struct sched_class	*sched_class;
+	struct sched_entity		se;
+	struct sched_rt_entity		rt;
+	struct sched_dl_entity		dl;
+
+	/* ... rest of task_struct ... */
+};
+
+// --- AFTER ---
+struct task_struct {
+	/* ... */
+	const struct sched_class	*sched_class;
+	struct sched_entity		se;
+	struct sched_rt_entity		rt;
+	struct sched_dl_entity		dl;
+	struct sched_awrr_entity	awrr;
+
+	/* ... rest of task_struct ... */
+};

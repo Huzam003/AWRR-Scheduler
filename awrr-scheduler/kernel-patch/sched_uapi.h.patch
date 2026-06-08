@@ -1,0 +1,32 @@
+/*
+ * sched_uapi.h.patch - Modifications to include/uapi/linux/sched.h
+ *
+ * Add the SCHED_AWRR policy constant visible to userspace.
+ * This allows userspace programs to use sched_setscheduler()
+ * with SCHED_AWRR.
+ */
+
+/* =====================================================================
+ * CHANGE 1: Add SCHED_AWRR policy constant
+ *
+ * Location: After #define SCHED_DEADLINE 6
+ * ===================================================================== */
+
+// --- BEFORE ---
+#define SCHED_NORMAL		0
+#define SCHED_FIFO		1
+#define SCHED_RR		2
+#define SCHED_BATCH		3
+/* SCHED_ISO: reserved but not implemented yet */
+#define SCHED_IDLE		5
+#define SCHED_DEADLINE		6
+
+// --- AFTER ---
+#define SCHED_NORMAL		0
+#define SCHED_FIFO		1
+#define SCHED_RR		2
+#define SCHED_BATCH		3
+/* SCHED_ISO: reserved but not implemented yet */
+#define SCHED_IDLE		5
+#define SCHED_DEADLINE		6
+#define SCHED_AWRR		7	/* Adaptive Weighted Round-Robin */

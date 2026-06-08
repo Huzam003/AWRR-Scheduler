@@ -1,0 +1,1245 @@
+================================================================================
+LINUX KERNEL 6.1 LTS - SCHEDULING SUBSYSTEM REFERENCE
+For implementing AWRR (Adaptive Weighted Round-Robin) scheduling class
+================================================================================
+
+Kernel version: v6.1 (LTS)
+Source tree: https://github.com/torvalds/linux/tree/v6.1
+Browsable: https://elixir.bootlin.com/linux/v6.1/source
+
+================================================================================
+1. struct sched_class - COMPLETE FUNCTION POINTER LIST
+================================================================================
+
+File: kernel/sched/sched.h
+
+struct sched_class {
+
+#ifdef CONFIG_UCLAMP_TASK
+    int uclamp_enabled;
+#endif
+
+    /* --- Core scheduling operations --- */
+
+    void (*enqueue_task)(struct rq *rq, struct task_struct *p, int flags);
+        // Called when a task becomes runnable (wakeup, fork, migration).
+        // flags: ENQUEUE_WAKEUP, ENQUEUE_RESTORE, ENQUEUE_MIGRATED, etc.
+
+    void (*dequeue_task)(struct rq *rq, struct task_struct *p, int flags);
+        // Called when a task leaves runnable state (sleep, exit, migration).
+        // flags: DEQUEUE_SLEEP, DEQUEUE_SAVE, DEQUEUE_MIGRATING, etc.
+
+    void (*yield_task)(struct rq *rq);
+        // Called when a task voluntarily yields the CPU (sched_yield()).
+
+    bool (*yield_to_task)(struct rq *rq, struct task_struct *p);
+        // Yield to a specific task. Returns true if successful.
+
+    void (*check_preempt_curr)(struct rq *rq, struct task_struct *p, int flags);
+        // Check if newly woken task 'p' should preempt currently running task.
+        // Called after enqueue on wakeup. Sets TIF_NEED_RESCHED if needed.
+
+    struct task_struct *(*pick_next_task)(struct rq *rq);
+        // Select the next task to run from this class's runqueue.
+        // Returns NULL if no runnable task exists in this class.
+
+    void (*put_prev_task)(struct rq *rq, struct task_struct *p);
+        // Called when task 'p' is about to be switched out of the CPU.
+        // Update accounting, re-insert into class data structures.
+
+    void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+        // Called when task 'p' is about to become the current running task.
+        // 'first' is true on initial pick, false on subsequent updates.
+
+#ifdef CONFIG_SMP
+    /* --- SMP / Load Balancing operations --- */
+
+    int (*balance)(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+        // Called from pick_next_task context. Opportunity to pull tasks.
+        // Returns 1 if a task was pulled and balance was performed.
+
+    int (*select_task_rq)(struct task_struct *p, int task_cpu, int flags);
+        // Select which CPU a task should run on.
+        // Called during wake-up and fork to determine target CPU.
+        // Returns the selected CPU number.
+
+    struct task_struct *(*pick_task)(struct rq *rq);
+        // Pick a task from this class for core scheduling (CONFIG_SCHED_CORE).
+        // Does NOT remove the task from runqueue. Read-only pick.
+
+    void (*migrate_task_rq)(struct task_struct *p, int new_cpu);
+        // Called when a task is being migrated to new_cpu.
+
+    void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+        // Called after a task is woken on this rq.
+
+    void (*set_cpus_allowed)(struct task_struct *p,
+                             const struct cpumask *newmask, u32 flags);
+        // Called when a task's CPU affinity mask is changed.
+
+    void (*rq_online)(struct rq *rq);
+        // Called when a CPU comes online.
+
+    void (*rq_offline)(struct rq *rq);
+        // Called when a CPU goes offline.
+
+    struct rq *(*find_lock_rq)(struct task_struct *p, struct rq *rq);
+        // Find and lock the runqueue containing task p.
+        // Used for task pushing/pulling in RT/DL.
+#endif
+
+    /* --- Timer and lifecycle callbacks --- */
+
+    void (*task_tick)(struct rq *rq, struct task_struct *p, int queued);
+        // Called from scheduler_tick() on each timer interrupt.
+        // 'queued' indicates if this task is on the runqueue.
+        // Opportunity to update time accounting and check preemption.
+
+    void (*task_fork)(struct task_struct *p);
+        // Called when a new child task is forked.
+        // Initialize scheduling entity for the child.
+
+    void (*task_dead)(struct task_struct *p);
+        // Called when a task exits (in do_exit).
+
+    /* --- Policy switching callbacks --- */
+
+    void (*switched_from)(struct rq *this_rq, struct task_struct *task);
+        // Called when a task switches AWAY from this scheduling class.
+
+    void (*switched_to)(struct rq *this_rq, struct task_struct *task);
+        // Called when a task switches TO this scheduling class.
+
+    void (*prio_changed)(struct rq *this_rq, struct task_struct *task,
+                         int oldprio);
+        // Called when a task's priority changes while in this class.
+
+    unsigned int (*get_rr_interval)(struct rq *rq, struct task_struct *task);
+        // Return the time slice for sched_rr_get_interval() syscall.
+        // Return value in jiffies.
+
+    void (*update_curr)(struct rq *rq);
+        // Update current task's runtime statistics.
+        // Called from various places to keep accounting current.
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+    void (*task_change_group)(struct task_struct *p);
+        // Called when a task changes cgroup.
+#endif
+};
+
+
+================================================================================
+2. SCHEDULING CLASS HIERARCHY AND ORDERING
+================================================================================
+
+File: kernel/sched/sched.h
+File: include/asm-generic/vmlinux.lds.h
+
+--- Hierarchy (highest to lowest priority) ---
+
+    stop_sched_class        (highest - migration/stop tasks, 1 per CPU)
+        |
+    dl_sched_class          (SCHED_DEADLINE tasks)
+        |
+    rt_sched_class          (SCHED_FIFO, SCHED_RR tasks)
+        |
+    *** AWRR GOES HERE ***  (insert between rt and fair)
+        |
+    fair_sched_class        (SCHED_NORMAL, SCHED_BATCH tasks - CFS)
+        |
+    idle_sched_class        (lowest - idle task, 1 per CPU)
+
+
+--- Modern Mechanism (kernel 5.9+ including 6.1): Linker Section Ordering ---
+
+In kernel 6.1, the old linked-list 'next' pointer is GONE. Instead, scheduling
+classes are ordered using linker sections and iterated using pointer arithmetic.
+
+The DEFINE_SCHED_CLASS macro (kernel/sched/sched.h):
+
+    #define DEFINE_SCHED_CLASS(name) \
+        const struct sched_class name##_sched_class \
+            __aligned(__alignof__(struct sched_class)) \
+            __section("__" #name "_sched_class")
+
+This places each sched_class instance into a named ELF section like:
+    "__stop_sched_class"
+    "__dl_sched_class"
+    "__rt_sched_class"
+    "__fair_sched_class"
+    "__idle_sched_class"
+
+The linker script (include/asm-generic/vmlinux.lds.h) orders them:
+
+    #define SCHED_DATA                  \
+        STRUCT_ALIGN();                 \
+        __sched_class_highest = .;      \
+        *(__stop_sched_class)           \
+        *(__dl_sched_class)             \
+        *(__rt_sched_class)             \
+        *(__fair_sched_class)           \
+        *(__idle_sched_class)           \
+        __sched_class_lowest = .;
+
+Boundary symbols:
+    extern struct sched_class __sched_class_highest[];
+    extern struct sched_class __sched_class_lowest[];
+
+Iteration macros (kernel/sched/sched.h):
+
+    #define for_class_range(class, _from, _to) \
+        for (class = (_from); class < (_to); class++)
+
+    #define for_each_class(class) \
+        for_class_range(class, __sched_class_highest, __sched_class_lowest)
+
+NOTE: Classes are laid out in memory from HIGHEST to LOWEST priority.
+The loop iterates from highest priority to lowest. The first class
+whose pick_next_task() returns non-NULL wins.
+
+Extern declarations for all classes:
+    extern const struct sched_class stop_sched_class;
+    extern const struct sched_class dl_sched_class;
+    extern const struct sched_class rt_sched_class;
+    extern const struct sched_class fair_sched_class;
+    extern const struct sched_class idle_sched_class;
+
+
+--- HOW TO INSERT AWRR BETWEEN RT AND FAIR ---
+
+1. In kernel/sched/awrr.c, define:
+       DEFINE_SCHED_CLASS(awrr) = { ... };
+   This creates section "__awrr_sched_class".
+
+2. In include/asm-generic/vmlinux.lds.h, modify SCHED_DATA:
+       #define SCHED_DATA                  \
+           STRUCT_ALIGN();                 \
+           __sched_class_highest = .;      \
+           *(__stop_sched_class)           \
+           *(__dl_sched_class)             \
+           *(__rt_sched_class)             \
+           *(__awrr_sched_class)           \   <-- ADD THIS LINE
+           *(__fair_sched_class)           \
+           *(__idle_sched_class)           \
+           __sched_class_lowest = .;
+
+3. In kernel/sched/sched.h, add extern:
+       extern const struct sched_class awrr_sched_class;
+
+4. The for_each_class macro will automatically iterate through AWRR
+   in the correct priority position.
+
+
+================================================================================
+3. struct task_struct SCHEDULING FIELDS
+================================================================================
+
+File: include/linux/sched.h
+
+--- Core scheduling fields in task_struct ---
+
+    int                         on_rq;
+        // 0 = not on runqueue, TASK_ON_RQ_QUEUED = on rq,
+        // TASK_ON_RQ_MIGRATING = being migrated
+
+    int                         prio;
+        // Dynamic priority (effective priority used by scheduler).
+        // Range: 0-139 (0-99 = RT, 100-139 = normal/nice)
+
+    int                         static_prio;
+        // Set by nice value. Does not change during execution.
+        // Range: 100-139 (maps to nice -20 to +19)
+        // Calculated as: MAX_RT_PRIO + nice + 20
+
+    int                         normal_prio;
+        // Priority without PI boosting. Same as static_prio for
+        // normal tasks, same as prio for RT tasks.
+
+    unsigned int                rt_priority;
+        // Real-time priority (1-99, 99 is highest).
+        // Only meaningful for SCHED_FIFO/SCHED_RR.
+
+    const struct sched_class    *sched_class;
+        // Pointer to the scheduling class this task belongs to.
+        // Set when policy changes (e.g., sched_setscheduler).
+
+    unsigned int                policy;
+        // Scheduling policy: SCHED_NORMAL, SCHED_FIFO, SCHED_RR,
+        // SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, or SCHED_AWRR (new).
+
+    /* --- Per-class scheduling entities (embedded, not pointers) --- */
+
+    struct sched_entity         se;      // CFS scheduling entity
+    struct sched_rt_entity      rt;      // RT scheduling entity
+    struct sched_dl_entity      dl;      // Deadline scheduling entity
+
+    /* --- Context switch counters --- */
+
+    unsigned long               nvcsw;   // # voluntary context switches
+    unsigned long               nivcsw;  // # involuntary context switches
+
+    /* --- Scheduling statistics --- */
+
+    struct sched_info           sched_info;    // Scheduling info
+    struct sched_statistics     stats;         // Detailed sched statistics
+
+    /* --- SMP fields --- */
+
+    int                         on_cpu;          // Currently running on CPU
+    int                         recent_used_cpu; // Last CPU used
+    int                         wake_cpu;        // CPU to wake on
+    int                         nr_cpus_allowed; // # CPUs in affinity mask
+    const cpumask_t             *cpus_ptr;       // Effective CPU affinity
+    cpumask_t                   cpus_mask;       // User-set CPU affinity
+    unsigned short              migration_disabled;
+    unsigned short              migration_flags;
+    struct task_struct          *last_wakee;
+    unsigned int                wakee_flips;
+    unsigned long               wakee_flip_decay_ts;
+
+
+--- HOW TO ADD AN AWRR ENTITY ---
+
+Add a new embedded struct to task_struct (in include/linux/sched.h):
+
+    struct sched_awrr_entity    awrr;    // AWRR scheduling entity
+
+Define struct sched_awrr_entity (in a new header or in include/linux/sched.h):
+
+    struct sched_awrr_entity {
+        struct list_head    run_list;        // Node in awrr_rq's task list
+        unsigned int        time_slice;      // Current remaining time slice (ticks)
+        unsigned int        weight;          // Task weight (adaptive)
+        unsigned int        orig_weight;     // Original weight before adaptation
+        u64                 exec_start;      // When current execution started
+        u64                 sum_exec_runtime;// Total CPU time consumed
+        u64                 wait_start;      // When task started waiting
+        u64                 sum_wait_time;   // Total wait time
+        unsigned int        nr_yields;       // Number of voluntary yields
+        unsigned short      on_rq;           // Currently on AWRR runqueue
+    };
+
+
+================================================================================
+4. SCHED_* POLICY CONSTANTS
+================================================================================
+
+File: include/uapi/linux/sched.h
+
+--- Existing policy constants ---
+
+    #define SCHED_NORMAL    0       // CFS - default time-sharing
+    #define SCHED_FIFO      1       // Real-time FIFO (no timeslice)
+    #define SCHED_RR        2       // Real-time round-robin
+    #define SCHED_BATCH     3       // CFS - batch processing (no preemption bonus)
+    /* SCHED_ISO: reserved, not implemented (would be 4) */
+    #define SCHED_IDLE      5       // CFS - very low priority background
+    #define SCHED_DEADLINE  6       // Deadline scheduling (EDF + CBS)
+
+    #define SCHED_RESET_ON_FORK  0x40000000  // Reset policy on fork
+
+--- Scheduling flags (for sched_setattr/sched_getattr) ---
+
+    #define SCHED_FLAG_RESET_ON_FORK    0x01
+    #define SCHED_FLAG_RECLAIM          0x02
+    #define SCHED_FLAG_DL_OVERRUN       0x04
+    #define SCHED_FLAG_KEEP_POLICY      0x08
+    #define SCHED_FLAG_KEEP_PARAMS      0x10
+    #define SCHED_FLAG_UTIL_CLAMP_MIN   0x20
+    #define SCHED_FLAG_UTIL_CLAMP_MAX   0x40
+
+--- Adding SCHED_AWRR ---
+
+In include/uapi/linux/sched.h, add:
+    #define SCHED_AWRR      7       // Adaptive Weighted Round-Robin
+
+Then in kernel/sched/sched.h, add policy check helpers:
+    static inline bool awrr_policy(int policy)
+    {
+        return policy == SCHED_AWRR;
+    }
+
+    static inline bool task_has_awrr_policy(struct task_struct *p)
+    {
+        return awrr_policy(p->policy);
+    }
+
+In kernel/sched/core.c, update __sched_setscheduler() to accept SCHED_AWRR
+and route it to awrr_sched_class.
+
+Also update valid_policy():
+    static inline int valid_policy(int policy)
+    {
+        return policy == SCHED_NORMAL || policy == SCHED_BATCH ||
+               policy == SCHED_IDLE || policy == SCHED_FIFO ||
+               policy == SCHED_RR || policy == SCHED_DEADLINE ||
+               policy == SCHED_AWRR;
+    }
+
+
+================================================================================
+5. PER-CPU RUN QUEUE (struct rq)
+================================================================================
+
+File: kernel/sched/sched.h
+
+--- struct rq (key fields) ---
+
+    struct rq {
+        raw_spinlock_t      __lock;         // Main runqueue lock
+
+        unsigned int        nr_running;     // Total tasks on this rq
+                                            // (across ALL scheduling classes)
+
+        /* --- Embedded per-class runqueues --- */
+        struct cfs_rq       cfs;            // CFS runqueue
+        struct rt_rq        rt;             // RT runqueue
+        struct dl_rq        dl;             // Deadline runqueue
+
+        /* --- Current/special tasks --- */
+        struct task_struct __rcu *curr;      // Currently running task
+        struct task_struct  *idle;           // This CPU's idle task
+        struct task_struct  *stop;           // Stop/migration task
+
+        /* --- Timing --- */
+        unsigned long       next_balance;   // Next load balance time
+        struct mm_struct    *prev_mm;        // Previous task's mm
+
+        /* --- Clock --- */
+        u64                 clock;           // rq clock (ns)
+        u64                 clock_task;      // task-only clock (excludes irq)
+        u64                 clock_pelt;      // PELT clock
+
+        /* Other fields for SMP, load tracking, CPU frequency, etc. */
+    };
+
+    Declared per-CPU in core.c:
+        DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+
+    Access macros:
+        #define cpu_rq(cpu)     (&per_cpu(runqueues, (cpu)))
+        #define this_rq()       this_cpu_ptr(&runqueues)
+        #define task_rq(p)      cpu_rq(task_cpu(p))
+
+--- struct cfs_rq (CFS runqueue) ---
+
+    struct cfs_rq {
+        struct load_weight  load;               // Aggregate load of all tasks
+        unsigned int        nr_running;          // # runnable tasks in this cfs_rq
+        unsigned int        h_nr_running;        // Hierarchical nr_running
+        unsigned int        idle_nr_running;     // # SCHED_IDLE tasks running
+        unsigned int        idle_h_nr_running;   // Hierarchical idle count
+
+        u64                 exec_clock;          // Execution clock
+        u64                 min_vruntime;        // Minimum vruntime (monotonic)
+
+        struct rb_root_cached tasks_timeline;    // Red-black tree of sched_entities
+                                                 // (rb_root_cached = root + leftmost)
+
+        struct sched_entity *curr;               // Currently running entity
+        struct sched_entity *next;               // Next entity hint
+        struct sched_entity *last;               // Last entity hint
+        struct sched_entity *skip;               // Entity to skip
+
+        /* CONFIG_SMP fields for load tracking, bandwidth, etc. */
+    #ifdef CONFIG_SMP
+        struct sched_avg    avg;                 // Per-rq load average
+    #endif
+    };
+
+--- struct rt_rq (RT runqueue) ---
+
+    struct rt_rq {
+        struct rt_prio_array active;        // Priority array (bitmap + lists)
+        unsigned int        rt_nr_running;  // Total RT tasks
+        unsigned int        rr_nr_running;  // SCHED_RR tasks only
+
+        int                 rt_queued;      // Whether RT tasks are queued
+        int                 rt_throttled;   // RT bandwidth throttling active
+
+        u64                 rt_time;        // Time consumed in current period
+        u64                 rt_runtime;     // Max runtime per period
+
+        raw_spinlock_t      rt_runtime_lock;
+    };
+
+    struct rt_prio_array {
+        DECLARE_BITMAP(bitmap, MAX_RT_PRIO + 1);  // Priority bitmap (100 bits)
+        struct list_head queue[MAX_RT_PRIO];       // Per-priority task lists
+    };
+
+
+--- HOW TO ADD awrr_rq ---
+
+1. Define struct awrr_rq (in kernel/sched/awrr.h or kernel/sched/sched.h):
+
+    struct awrr_rq {
+        struct list_head    task_list;       // Circular list of AWRR tasks
+        unsigned int        nr_running;      // # runnable AWRR tasks
+        unsigned int        total_weight;    // Sum of all task weights
+        struct sched_awrr_entity *curr;      // Currently running entity
+        u64                 exec_clock;      // Total execution clock
+        raw_spinlock_t      lock;            // AWRR-specific lock (if needed)
+    };
+
+2. Embed in struct rq (kernel/sched/sched.h), add after rt:
+
+    struct rq {
+        ...
+        struct rt_rq    rt;
+        struct awrr_rq  awrr;    /* <-- ADD HERE */
+        struct dl_rq    dl;
+        ...
+    };
+
+3. Initialize in rq_init() / sched_init() in core.c.
+
+
+================================================================================
+6. core.c - SCHEDULER REGISTRATION AND __schedule() LOOP
+================================================================================
+
+File: kernel/sched/core.c
+
+--- Per-CPU runqueue declaration ---
+
+    DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+
+--- The main scheduling function ---
+
+The __schedule() function is the heart of the Linux scheduler:
+
+    static void __sched notrace __schedule(unsigned int sched_mode)
+    {
+        struct task_struct *prev, *next;
+        unsigned long *switch_count;
+        unsigned long prev_state;
+        struct rq_flags rf;
+        struct rq *rq;
+        int cpu;
+
+        cpu = smp_processor_id();
+        rq = cpu_rq(cpu);
+        prev = rq->curr;
+
+        /* ... handle task state transitions, dequeue sleeping tasks ... */
+
+        /* If prev is sleeping/dead, dequeue it */
+        if (!preempt && prev_state) {
+            if (signal_pending_state(prev_state, prev)) {
+                WRITE_ONCE(prev->__state, TASK_RUNNING);
+            } else {
+                deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+                /* ... */
+            }
+        }
+
+        /* Pick the next task - THIS IS THE KEY PART */
+        next = pick_next_task(rq, prev, &rf);
+
+        /* Context switch if different task selected */
+        if (likely(prev != next)) {
+            rq->nr_switches++;
+            rq->curr = next;
+            /* ... update stats ... */
+            rq = context_switch(rq, prev, next, &rf);
+        } else {
+            rq_unpin_lock(rq, &rf);
+            __balance_callbacks(rq);
+            raw_spin_rq_unlock_irq(rq);
+        }
+    }
+
+--- pick_next_task() ---
+
+There are two versions: an optimized one and a generic one.
+
+Optimized path (when all tasks are CFS):
+
+    static inline struct task_struct *
+    __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+    {
+        const struct sched_class *class;
+        struct task_struct *p;
+
+        /* Optimization: if all tasks are in fair class, go straight to CFS */
+        if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+                   rq->nr_running == rq->cfs.h_nr_running)) {
+
+            p = pick_next_task_fair(rq, prev, rf);
+            if (unlikely(p == RETRY_TASK))
+                goto restart;
+            if (!p) {
+                put_prev_task(rq, prev);
+                p = pick_next_task_idle(rq);
+            }
+            return p;
+        }
+
+    restart:
+        put_prev_task_balance(rq, prev, rf);
+
+        /* Generic path: iterate through all classes highest to lowest */
+        for_each_class(class) {
+            p = class->pick_next_task(rq);
+            if (p)
+                return p;
+        }
+        /* Should never reach here - idle class always returns a task */
+        BUG();
+    }
+
+NOTE: The for_each_class(class) macro iterates from __sched_class_highest
+to __sched_class_lowest. When AWRR is inserted between RT and FAIR in the
+linker script, it will be checked after RT and before FAIR automatically.
+
+--- schedule() wrapper ---
+
+    asmlinkage __visible void __sched schedule(void)
+    {
+        struct task_struct *tsk = current;
+
+        sched_submit_work(tsk);
+        do {
+            preempt_disable();
+            __schedule(SM_NONE);
+            sched_preempt_enable_no_resched();
+        } while (need_resched());
+        sched_update_worker(tsk);
+    }
+    EXPORT_SYMBOL(schedule);
+
+--- Helper functions used in the scheduling path ---
+
+    static inline void enqueue_task(struct rq *rq, struct task_struct *p,
+                                    int flags)
+    {
+        /* ... update stats ... */
+        p->sched_class->enqueue_task(rq, p, flags);
+    }
+
+    static inline void dequeue_task(struct rq *rq, struct task_struct *p,
+                                    int flags)
+    {
+        /* ... update stats ... */
+        p->sched_class->dequeue_task(rq, p, flags);
+    }
+
+    static inline void put_prev_task(struct rq *rq, struct task_struct *p)
+    {
+        WARN_ON_ONCE(rq->curr != p);
+        p->sched_class->put_prev_task(rq, p);
+    }
+
+    static inline void set_next_task(struct rq *rq, struct task_struct *p)
+    {
+        p->sched_class->set_next_task(rq, p, false);
+    }
+
+--- Scheduling class priority comparison ---
+
+    static inline bool sched_class_above(const struct sched_class *a,
+                                         const struct sched_class *b)
+    {
+        /* Classes are ordered highest-to-lowest in memory.
+         * Higher priority = lower address. */
+        return a < b;
+    }
+
+
+================================================================================
+7. SYSCTL REGISTRATION PATTERN
+================================================================================
+
+File: kernel/sched/debug.c (debugfs interface)
+File: kernel/sched/core.c (some sysctl variables)
+File: kernel/sysctl.c (global sysctl table)
+
+--- Scheduler parameters exposed via debugfs ---
+
+In kernel 6.1, CFS scheduler parameters are primarily exposed through
+debugfs (when CONFIG_SCHED_DEBUG is enabled):
+
+    /sys/kernel/debug/sched/latency_ns
+    /sys/kernel/debug/sched/min_granularity_ns
+    /sys/kernel/debug/sched/idle_min_granularity_ns
+    /sys/kernel/debug/sched/wakeup_granularity_ns
+    /sys/kernel/debug/sched/tunable_scaling
+    /sys/kernel/debug/sched/migration_cost_ns
+    /sys/kernel/debug/sched/nr_migrate
+
+Registration in kernel/sched/debug.c:
+
+    debugfs_create_u32("latency_ns", 0644, debugfs_sched,
+                       &sysctl_sched_latency);
+    debugfs_create_u32("min_granularity_ns", 0644, debugfs_sched,
+                       &sysctl_sched_min_granularity);
+
+--- RT-specific sysctls via /proc/sys/kernel/ ---
+
+Some scheduler parameters are registered through the traditional sysctl
+mechanism in kernel/sched/core.c or kernel/sysctl.c:
+
+    /proc/sys/kernel/sched_rt_period_us     (default: 1000000 = 1 second)
+    /proc/sys/kernel/sched_rt_runtime_us    (default: 950000  = 0.95 sec)
+    /proc/sys/kernel/sched_rr_timeslice_ms  (default: 100 ms)
+    /proc/sys/kernel/sched_child_runs_first
+
+The sysctl table entry pattern:
+
+    static struct ctl_table kern_table[] = {
+        {
+            .procname    = "sched_rt_period_us",
+            .data        = &sysctl_sched_rt_period,
+            .maxlen      = sizeof(unsigned int),
+            .mode        = 0644,
+            .proc_handler = sched_rt_handler,
+        },
+        {
+            .procname    = "sched_rt_runtime_us",
+            .data        = &sysctl_sched_rt_runtime,
+            .maxlen      = sizeof(int),
+            .mode        = 0644,
+            .proc_handler = sched_rt_handler,
+        },
+        {
+            .procname    = "sched_rr_timeslice_ms",
+            .data        = &sysctl_sched_rr_timeslice,
+            .maxlen      = sizeof(int),
+            .mode        = 0644,
+            .proc_handler = sched_rr_handler,
+        },
+        /* ... */
+    };
+
+Common proc_handler functions:
+    proc_dointvec          - read/write integer
+    proc_dointvec_minmax   - integer with min/max bounds
+    proc_doulongvec_minmax - unsigned long with bounds
+    proc_dostring          - string parameter
+
+--- HOW TO ADD AWRR SYSCTL PARAMETERS ---
+
+Option A: Debugfs (simpler, for development):
+
+    In kernel/sched/awrr.c:
+
+    static unsigned int sysctl_awrr_base_slice = 10000000;  /* 10ms in ns */
+    static unsigned int sysctl_awrr_adaptation_period = 100000000; /* 100ms */
+
+    void __init init_awrr_debugfs(struct dentry *debugfs_sched)
+    {
+        debugfs_create_u32("awrr_base_slice_ns", 0644,
+                           debugfs_sched, &sysctl_awrr_base_slice);
+        debugfs_create_u32("awrr_adaptation_period_ns", 0644,
+                           debugfs_sched, &sysctl_awrr_adaptation_period);
+    }
+
+Option B: Traditional sysctl (for /proc/sys/kernel/):
+
+    static struct ctl_table awrr_sysctls[] = {
+        {
+            .procname    = "sched_awrr_base_slice_us",
+            .data        = &sysctl_awrr_base_slice,
+            .maxlen      = sizeof(unsigned int),
+            .mode        = 0644,
+            .proc_handler = proc_dointvec_minmax,
+            .extra1      = SYSCTL_ONE,
+            .extra2      = &max_slice,
+        },
+        {}  /* sentinel */
+    };
+
+    /* Register in init function */
+    register_sysctl("kernel", awrr_sysctls);
+
+
+================================================================================
+8. FIXED-POINT ARITHMETIC IN THE KERNEL
+================================================================================
+
+File: kernel/sched/sched.h (load_weight, WMULT_*)
+File: kernel/sched/core.c (weight arrays, set_load_weight)
+File: kernel/sched/fair.c (__calc_delta, calc_delta_fair)
+
+The kernel CANNOT use floating-point arithmetic. All scheduler math uses
+integer arithmetic with fixed-point techniques.
+
+--- Load Weight Structure ---
+
+    struct load_weight {
+        unsigned long   weight;       // Task weight
+        u32             inv_weight;   // Precomputed inverse: (2^32) / weight
+    };
+
+--- Weight Constants ---
+
+    #define NICE_0_LOAD_SHIFT  10
+    #define NICE_0_LOAD        (1L << NICE_0_LOAD_SHIFT)  /* = 1024 */
+
+    #define WMULT_SHIFT        32    /* Fixed-point shift for inverse weights */
+    #define WMULT_CONST        (~0UL) /* = 2^32 - 1 = 4294967295 */
+
+    /* Special weights for SCHED_IDLE tasks */
+    #define WEIGHT_IDLEPRIO    3
+    #define WMULT_IDLEPRIO     1431655765  /* (2^32) / 3 */
+
+--- Priority-to-Weight Mapping Table ---
+
+The sched_prio_to_weight[] array maps nice values to weights.
+Nice 0 = weight 1024 (the baseline). Each nice level is ~1.25x.
+
+    const int sched_prio_to_weight[40] = {
+     /* nice -20 */  88761,  71755,  56483,  46273,  36291,
+     /* nice -15 */  29154,  23254,  18705,  14949,  11916,
+     /* nice -10 */   9548,   7620,   6100,   4904,   3906,
+     /* nice  -5 */   3121,   2501,   1991,   1586,   1277,
+     /* nice   0 */   1024,    820,    655,    526,    423,
+     /* nice   5 */    335,    272,    215,    172,    137,
+     /* nice  10 */    110,     87,     70,     56,     45,
+     /* nice  15 */     36,     29,     23,     18,     15,
+    };
+
+--- Inverse Weight Table (precomputed 2^32 / weight) ---
+
+    const u32 sched_prio_to_wmult[40] = {
+     /* nice -20 */     48388,     59856,     76040,     92818,    118348,
+     /* nice -15 */    147320,    184698,    229616,    287308,    360437,
+     /* nice -10 */    449829,    563644,    704093,    875809,   1099582,
+     /* nice  -5 */   1376151,   1717300,   2157191,   2708050,   3363326,
+     /* nice   0 */   4194304,   5237765,   6557202,   8165337,  10153587,
+     /* nice   5 */  12820798,  15790321,  19976592,  24970740,  31350126,
+     /* nice  10 */  39045157,  49367440,  61356676,  76695844,  95443717,
+     /* nice  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+    };
+
+--- set_load_weight() ---
+
+    static void set_load_weight(struct task_struct *p, bool update_load)
+    {
+        int prio = p->static_prio - MAX_RT_PRIO;  /* 0..39 from nice */
+        struct load_weight *load = &p->se.load;
+
+        if (task_has_idle_policy(p)) {
+            load->weight = scale_load(WEIGHT_IDLEPRIO);
+            load->inv_weight = WMULT_IDLEPRIO;
+            return;
+        }
+
+        if (update_load && p->sched_class == &fair_sched_class) {
+            reweight_task(p, prio);
+        } else {
+            load->weight = scale_load(sched_prio_to_weight[prio]);
+            load->inv_weight = sched_prio_to_wmult[prio];
+        }
+    }
+
+--- Fixed-Point Division via Multiplication ---
+
+The key trick: instead of dividing by weight, multiply by inv_weight
+and right-shift by WMULT_SHIFT (32).
+
+    delta_weighted = (delta_exec * NICE_0_LOAD * inv_weight) >> WMULT_SHIFT
+
+This is equivalent to:
+    delta_weighted = delta_exec * (NICE_0_LOAD / weight)
+
+But avoids the division entirely!
+
+    static u64 __calc_delta(u64 delta_exec, unsigned long weight,
+                            struct load_weight *lw)
+    {
+        u64 fact = scale_load_down(weight);
+        int shift = WMULT_SHIFT;
+
+        __update_inv_weight(lw);
+
+        if (unlikely(fact >> 32)) {
+            while (fact >> 32) {
+                fact >>= 1;
+                shift--;
+            }
+        }
+
+        fact = (u64)(u32)fact * lw->inv_weight;
+
+        while (fact >> 32) {
+            fact >>= 1;
+            shift--;
+        }
+
+        return mul_u64_u32_shr(delta_exec, fact, shift);
+    }
+
+--- calc_delta_fair() - CFS vruntime calculation ---
+
+    static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+    {
+        if (unlikely(se->load.weight != NICE_0_LOAD))
+            delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+        return delta;
+    }
+
+    // This computes:  vruntime_delta = wall_time * (1024 / task_weight)
+    // A task with weight 1024 (nice 0) gets vruntime == wall time.
+    // A task with weight 2048 (nice -5ish) gets vruntime = wall_time / 2.
+    // A task with weight 512  (nice +5ish) gets vruntime = wall_time * 2.
+
+
+--- FIXED-POINT PATTERNS FOR AWRR ---
+
+For AWRR, you can use the same pattern:
+
+    /* AWRR fixed-point weight representation */
+    #define AWRR_WEIGHT_SHIFT   10
+    #define AWRR_WEIGHT_BASE    (1 << AWRR_WEIGHT_SHIFT)  /* 1024 */
+
+    /* Time slice calculation (avoid float):
+     * slice = base_slice * weight / total_weight
+     * Using fixed-point:
+     * slice = (base_slice * weight + total_weight/2) / total_weight
+     * Or with shift:
+     * slice = (base_slice * weight * inv_total) >> SHIFT
+     */
+
+    static inline unsigned int awrr_calc_slice(unsigned int base_slice,
+                                               unsigned int weight,
+                                               unsigned int total_weight)
+    {
+        u64 slice;
+        if (unlikely(!total_weight))
+            return base_slice;
+        slice = (u64)base_slice * weight;
+        /* Round to nearest */
+        slice = (slice + total_weight / 2) / total_weight;
+        /* Ensure minimum of 1 tick */
+        return max_t(unsigned int, (unsigned int)slice, 1);
+    }
+
+
+================================================================================
+9. CFS HOOK IMPLEMENTATIONS (Reference for AWRR)
+================================================================================
+
+File: kernel/sched/fair.c
+
+--- Sysctl variables (top of fair.c) ---
+
+    unsigned int sysctl_sched_latency            = 6000000ULL;   /* 6ms */
+    unsigned int sysctl_sched_min_granularity     = 750000ULL;   /* 0.75ms */
+    unsigned int sysctl_sched_idle_min_granularity = 750000ULL;  /* 0.75ms */
+    unsigned int sysctl_sched_wakeup_granularity  = 1000000UL;   /* 1ms */
+
+    These are scaled by ilog(ncpus) at boot:
+        factor = 1 + ilog2(num_online_cpus())
+
+--- fair_sched_class initialization ---
+
+    DEFINE_SCHED_CLASS(fair) = {
+
+        .enqueue_task       = enqueue_task_fair,
+        .dequeue_task       = dequeue_task_fair,
+        .yield_task         = yield_task_fair,
+        .yield_to_task      = yield_to_task_fair,
+
+        .check_preempt_curr = check_preempt_wakeup,
+
+        .pick_next_task     = pick_next_task_fair,
+        .put_prev_task      = put_prev_task_fair,
+        .set_next_task      = set_next_task_fair,
+
+    #ifdef CONFIG_SMP
+        .balance            = balance_fair,
+        .pick_task          = pick_task_fair,
+        .select_task_rq     = select_task_rq_fair,
+        .migrate_task_rq    = migrate_task_rq_fair,
+
+        .rq_online          = rq_online_fair,
+        .rq_offline         = rq_offline_fair,
+
+        .task_dead           = task_dead_fair,
+        .set_cpus_allowed    = set_cpus_allowed_common,
+    #endif
+
+        .task_tick          = task_tick_fair,
+        .task_fork          = task_fork_fair,
+
+        .prio_changed       = prio_changed_fair,
+        .switched_from      = switched_from_fair,
+        .switched_to        = switched_to_fair,
+
+        .get_rr_interval    = get_rr_interval_fair,
+
+        .update_curr        = update_curr_fair,
+
+    #ifdef CONFIG_FAIR_GROUP_SCHED
+        .task_change_group  = task_change_group_fair,
+    #endif
+
+    #ifdef CONFIG_UCLAMP_TASK
+        .uclamp_enabled     = 1,
+    #endif
+    };
+
+--- rt_sched_class initialization (for comparison) ---
+
+    DEFINE_SCHED_CLASS(rt) = {
+
+        .enqueue_task       = enqueue_task_rt,
+        .dequeue_task       = dequeue_task_rt,
+        .yield_task         = yield_task_rt,
+
+        .check_preempt_curr = check_preempt_curr_rt,
+
+        .pick_next_task     = pick_next_task_rt,
+        .put_prev_task      = put_prev_task_rt,
+        .set_next_task      = set_next_task_rt,
+
+    #ifdef CONFIG_SMP
+        .balance            = balance_rt,
+        .pick_task          = pick_task_rt,
+        .select_task_rq     = select_task_rq_rt,
+        .set_cpus_allowed   = set_cpus_allowed_common,
+        .rq_online          = rq_online_rt,
+        .rq_offline         = rq_offline_rt,
+        .task_woken         = task_woken_rt,
+        .switched_from      = switched_from_rt,
+        .find_lock_rq       = find_lock_lowest_rq,
+    #endif
+
+        .task_tick          = task_tick_rt,
+
+        .get_rr_interval    = get_rr_interval_rt,
+
+        .prio_changed       = prio_changed_rt,
+        .switched_to        = switched_to_rt,
+
+        .update_curr        = update_curr_rt,
+
+    #ifdef CONFIG_UCLAMP_TASK
+        .uclamp_enabled     = 1,
+    #endif
+    };
+
+--- Key CFS function signatures ---
+
+    static void
+    enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+        // Walks up the sched_entity hierarchy, calling enqueue_entity()
+        // for each level. Increments cfs_rq->nr_running.
+        // Adds sched_entity to the RB tree via __enqueue_entity().
+
+    static void
+    dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+        // Walks up the hierarchy, calling dequeue_entity() at each level.
+        // Removes from RB tree via __dequeue_entity().
+        // Decrements cfs_rq->nr_running.
+
+    static struct task_struct *
+    pick_next_task_fair(struct rq *rq, struct task_struct *prev,
+                        struct rq_flags *rf)
+        // In kernel 6.1 with EEVDF: calls pick_eevdf() to select the
+        // entity with the earliest eligible virtual deadline.
+        // Calls put_prev_entity() and set_next_entity().
+        // Returns the selected task_struct or NULL.
+
+    static void
+    task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
+        // Called on each timer tick for CFS tasks.
+        // Walks up the entity hierarchy calling entity_tick().
+        // entity_tick() calls update_curr() and check_preempt_tick().
+
+    static void
+    check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
+        // Called when a CFS task wakes up to check if it should
+        // preempt the current task. Compares vruntimes.
+
+    static void
+    put_prev_task_fair(struct rq *rq, struct task_struct *prev)
+        // Called when prev task is being taken off the CPU.
+        // Calls put_prev_entity() which updates accounting
+        // and re-inserts entity into the RB tree.
+
+    static void
+    set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+        // Called when p is about to start running.
+        // Calls set_next_entity() which removes entity from
+        // the RB tree and sets cfs_rq->curr.
+
+--- update_curr() - The core accounting function ---
+
+    static void update_curr(struct cfs_rq *cfs_rq)
+    {
+        struct sched_entity *curr = cfs_rq->curr;
+        u64 now = rq_clock_task(rq_of(cfs_rq));
+        u64 delta_exec;
+
+        if (unlikely(!curr))
+            return;
+
+        delta_exec = now - curr->exec_start;
+        if (unlikely((s64)delta_exec <= 0))
+            return;
+
+        curr->exec_start = now;
+        curr->sum_exec_runtime += delta_exec;
+
+        /* Update vruntime (weighted by inverse of task weight) */
+        curr->vruntime += calc_delta_fair(delta_exec, curr);
+
+        /* Update min_vruntime */
+        update_min_vruntime(cfs_rq);
+
+        /* ... account to cgroup, update bandwidth ... */
+    }
+
+
+================================================================================
+10. KERNEL TIME ACCOUNTING
+================================================================================
+
+File: include/linux/sched.h
+
+--- struct sched_entity time fields ---
+
+    struct sched_entity {
+        struct load_weight  load;               // Task weight
+
+        u64                 exec_start;         // Wall clock when execution began
+                                                // (updated each time task is picked)
+
+        u64                 sum_exec_runtime;   // Total CPU time consumed (ns)
+                                                // Monotonically increasing.
+
+        u64                 vruntime;           // Virtual runtime (weighted CPU time)
+                                                // Used for RB tree ordering in CFS.
+
+        u64                 prev_sum_exec_runtime; // sum_exec_runtime when last put_prev
+                                                    // Diff = time on CPU this scheduling round.
+
+        u64                 nr_migrations;      // Times task migrated between CPUs
+        /* ... */
+    };
+
+--- struct sched_statistics (detailed stats, CONFIG_SCHEDSTATS) ---
+
+    struct sched_statistics {
+    #ifdef CONFIG_SCHEDSTATS
+        /* Wait time tracking */
+        u64     wait_start;             // When task started waiting in runqueue
+        u64     wait_max;               // Maximum wait time observed
+        u64     wait_count;             // Number of times waited
+        u64     wait_sum;               // Total wait time
+
+        /* IO wait tracking */
+        u64     iowait_count;           // Number of IO waits
+        u64     iowait_sum;             // Total IO wait time
+
+        /* Sleep tracking */
+        u64     sleep_start;            // When voluntary sleep began
+        u64     sleep_max;              // Maximum sleep duration
+        s64     sum_sleep_runtime;      // Total voluntary sleep time
+
+        /* Block tracking (involuntary sleep/mutex) */
+        u64     block_start;            // When involuntary block began
+        u64     block_max;              // Maximum block duration
+        s64     sum_block_runtime;      // Total block time
+
+        /* Execution maximums */
+        u64     exec_max;               // Maximum single execution slice
+        u64     slice_max;              // Maximum time slice used
+
+        /* Migration statistics */
+        u64     nr_migrations_cold;
+        u64     nr_failed_migrations_affine;
+        u64     nr_failed_migrations_running;
+        u64     nr_failed_migrations_hot;
+        u64     nr_forced_migrations;
+
+        /* Wakeup statistics */
+        u64     nr_wakeups;
+        u64     nr_wakeups_sync;
+        u64     nr_wakeups_migrate;
+        u64     nr_wakeups_local;
+        u64     nr_wakeups_remote;
+        u64     nr_wakeups_affine;
+        u64     nr_wakeups_affine_attempts;
+        u64     nr_wakeups_passive;
+        u64     nr_wakeups_idle;
+    #endif
+    };
+
+--- task_struct context switch counters ---
+
+    unsigned long   nvcsw;      // Voluntary context switches (task called schedule())
+    unsigned long   nivcsw;     // Involuntary context switches (preempted)
+    // Incremented in context_switch() in core.c
+
+--- struct sched_rt_entity time fields ---
+
+    struct sched_rt_entity {
+        struct list_head    run_list;           // Node in rt_rq priority queue
+        unsigned long       timeout;            // RT timeout count
+        unsigned long       watchdog_stamp;     // Watchdog timestamp
+        unsigned int        time_slice;         // Remaining time slice (RR only, in ticks)
+        unsigned short      on_rq;              // On RT runqueue
+        unsigned short      on_list;            // On priority list
+        /* ... */
+    };
+
+--- Clock access functions ---
+
+    u64 rq_clock(struct rq *rq);        // Raw rq clock (includes irq time)
+    u64 rq_clock_task(struct rq *rq);   // Task-only clock (excludes irq/steal)
+    u64 rq_clock_pelt(struct rq *rq);   // PELT (Per-Entity Load Tracking) clock
+
+    /* How to get current time in a scheduling hook:
+     *   u64 now = rq_clock_task(rq_of(cfs_rq));
+     * or for the main rq:
+     *   u64 now = rq_clock_task(rq);
+     */
+
+--- Constants ---
+
+    #define MAX_RT_PRIO        100    // 0-99 are RT priorities
+    #define MAX_PRIO           140    // 100-139 are normal (nice) priorities
+    #define NICE_WIDTH         40     // nice range: -20 to +19
+    #define MAX_NICE           19
+    #define MIN_NICE           (-20)
+    #define NICE_0_LOAD        1024   // Weight of nice-0 task
+
+    /* nice to prio mapping */
+    #define NICE_TO_PRIO(nice) ((nice) + DEFAULT_PRIO)
+    #define PRIO_TO_NICE(prio) ((prio) - DEFAULT_PRIO)
+    #define DEFAULT_PRIO       120    // = MAX_RT_PRIO + NICE_WIDTH/2
+
+    /* Time constants */
+    #define NSEC_PER_SEC       1000000000L
+    #define NSEC_PER_MSEC      1000000L
+    #define NSEC_PER_USEC      1000L
+    #define HZ                 250        // Typical (config-dependent)
+    #define TICK_NSEC          (NSEC_PER_SEC / HZ)  // = 4000000 ns = 4ms
+
+
+================================================================================
+SUMMARY: FILES TO MODIFY FOR AWRR IMPLEMENTATION
+================================================================================
+
+New files to create:
+    kernel/sched/awrr.c              - AWRR scheduling class implementation
+    kernel/sched/awrr.h              - AWRR internal header (optional)
+    Documentation/scheduler/sched-awrr.rst  - Documentation
+
+Files to modify:
+    include/uapi/linux/sched.h       - Add SCHED_AWRR constant
+    include/linux/sched.h            - Add struct sched_awrr_entity, embed in task_struct
+    include/asm-generic/vmlinux.lds.h - Add __awrr_sched_class to SCHED_DATA
+    kernel/sched/sched.h             - Add awrr_rq, extern decl, policy helpers
+    kernel/sched/core.c              - Update valid_policy(), __sched_setscheduler(),
+                                       init_awrr_rq() in sched_init()
+    kernel/sched/Makefile            - Add awrr.o to obj-y
+
+================================================================================
+END OF REFERENCE
+================================================================================

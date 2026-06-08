@@ -1,0 +1,95 @@
+AWRR Scheduler Research Report - Reference Document
+===================================================
+Student: Syed Wasif Ali Shah | Roll: 242334 | Air University NCSA
+Course: Operating Systems | Date: May 2026
+
+DESIGN SPECIFICATION
+====================
+
+1. SYSTEM OVERVIEW
+- New scheduling class: SCHED_AWRR
+- Position: between rt_sched_class and fair_sched_class
+- Processes assigned via sched_setscheduler() with SCHED_AWRR policy
+- Three components: Behavior Classification Engine, Dynamic Weight Calculator, Anti-Starvation Safeguard
+
+2. BEHAVIOR CLASSIFICATION ENGINE
+Tracks 3 per-process metrics at each tick (~1ms):
+
+CPU Burst Ratio (B): B = actual_runtime / allocated_quantum
+- Close to 1.0 = CPU-bound, significantly below 1.0 = I/O-bound
+
+Voluntary Yield Frequency (Y): yields per scheduling epoch (per 100 ticks)
+- High = I/O-bound
+
+I/O Wait Ratio (W): time in TASK_INTERRUPTIBLE/TASK_UNINTERRUPTIBLE vs TASK_RUNNING
+
+EWMA smoothing: metric(t) = α × observed(t) + (1 - α) × metric(t-1), α = 0.3
+
+Composite Score: S = 0.5 × B + 0.3 × (1 - Y_norm) + 0.2 × (1 - W)
+- S > 0.7 → CPU-bound
+- S < 0.3 → I/O-bound
+- 0.3 ≤ S ≤ 0.7 → mixed
+
+3. DYNAMIC WEIGHT CALCULATOR
+Recalculation every 100 ticks (~100ms):
+- CPU-bound (S > 0.7): weight decreased by δ=1, min w_min=1
+- I/O-bound (S < 0.3): weight increased by δ=1, max w_max=10
+- Mixed (0.3 ≤ S ≤ 0.7): weight adjusted toward w_default=5 by δ=1
+
+Weight range: [1, 10]
+
+4. ANTI-STARVATION SAFEGUARD
+- Track cumulative wait time since last CPU allocation
+- If wait > T_starve (500ms), emergency boost to w_max
+- Boost persists for one epoch, then normal adjustment resumes
+- Minimum quantum guarantee: every process gets at least one quantum per WRR cycle
+
+5. SHORT-LIVED PROCESS HANDLING
+- Processes < 10 ticks (10ms) stay at w_default=5
+- No classification overhead for transient processes
+
+IMPLEMENTATION ARCHITECTURE
+============================
+
+Files to modify/create:
+- include/linux/sched.h         → Add SCHED_AWRR constant, awrr_entity to task_struct
+- include/uapi/linux/sched.h    → Export SCHED_AWRR to userspace
+- kernel/sched/awrr.c           → NEW: complete scheduling class
+- kernel/sched/awrr.h           → NEW: data structures and constants
+- kernel/sched/core.c           → Register awrr_sched_class in hierarchy
+- kernel/sched/Makefile          → Add awrr.o
+- kernel/sysctl.c               → Expose tuning params at /proc/sys/kernel/sched_awrr/
+
+Key Data Structures:
+- struct awrr_entity: weight, burst_ratio, yield_freq, io_wait_ratio, behavior_score,
+  tick_counter, epoch_counter, wait_time, list_head node
+- struct awrr_rq: doubly-linked list of runnable tasks, nr_running, total_weight
+
+Scheduling Class Hooks:
+- enqueue_task_awrr()
+- dequeue_task_awrr()
+- pick_next_task_awrr()
+- task_tick_awrr()
+- check_preempt_curr_awrr()
+
+Target: Linux kernel 6.1 LTS
+
+EVALUATION METHODOLOGY
+======================
+
+Benchmarks:
+1. hackbench: 10 groups, 40 fds, 100 messages of 100 bytes, process mode
+2. schbench: 4 workers, 30ms sleep, 1ms CPU spin → p50/p95/p99 latency
+3. sysbench: cpu --cpu-max-prime=20000, 8 threads → events/sec
+
+Workload Scenarios:
+- Pure CPU-Bound: 8 threads sysbench cpu
+- Pure I/O-Bound: schbench 4 workers, 30ms sleep, 1ms spin
+- Mixed: 4 sysbench CPU + 4 schbench workers concurrent
+
+Compare against: Static WRR, CFS (kernel 6.1), EEVDF (kernel 6.6+)
+10 iterations each, mean + stddev
+Test env: QEMU/KVM, 4 vCPUs pinned to physical cores
+
+Metrics: turnaround time, waiting time, scheduling latency (p50/p95/p99),
+throughput (events/sec), context switch rate

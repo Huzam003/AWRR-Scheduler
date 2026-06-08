@@ -1,0 +1,109 @@
+/*
+ * sched.h.patch - Modifications to kernel/sched/sched.h
+ *
+ * This patch adds AWRR support to the internal scheduler header:
+ *   1. Include the AWRR header
+ *   2. Declare the awrr_sched_class extern
+ *   3. Add policy check helpers
+ *   4. Embed struct awrr_rq in struct rq
+ */
+
+/* =====================================================================
+ * CHANGE 1: Add AWRR header include
+ *
+ * Location: Near the top of kernel/sched/sched.h, after existing includes
+ * Add after: #include "cpupri.h"
+ * ===================================================================== */
+
+// --- BEFORE ---
+#include "cpupri.h"
+#include "cpudeadline.h"
+
+// --- AFTER ---
+#include "cpupri.h"
+#include "cpudeadline.h"
+#include "awrr.h"
+
+
+/* =====================================================================
+ * CHANGE 2: Add extern declaration for awrr_sched_class
+ *
+ * Location: After the existing sched_class externs
+ * Add after: extern const struct sched_class rt_sched_class;
+ * ===================================================================== */
+
+// --- BEFORE ---
+extern const struct sched_class stop_sched_class;
+extern const struct sched_class dl_sched_class;
+extern const struct sched_class rt_sched_class;
+extern const struct sched_class fair_sched_class;
+extern const struct sched_class idle_sched_class;
+
+// --- AFTER ---
+extern const struct sched_class stop_sched_class;
+extern const struct sched_class dl_sched_class;
+extern const struct sched_class rt_sched_class;
+extern const struct sched_class awrr_sched_class;
+extern const struct sched_class fair_sched_class;
+extern const struct sched_class idle_sched_class;
+
+
+/* =====================================================================
+ * CHANGE 3: Add AWRR policy check helpers
+ *
+ * Location: After the existing policy helpers (rt_policy, dl_policy, etc.)
+ * Add after the dl_policy/task_has_dl_policy block.
+ * ===================================================================== */
+
+// --- ADD THESE NEW FUNCTIONS ---
+
+static inline bool awrr_policy(int policy)
+{
+	return policy == SCHED_AWRR;
+}
+
+static inline bool task_has_awrr_policy(struct task_struct *p)
+{
+	return awrr_policy(p->policy);
+}
+
+
+/* =====================================================================
+ * CHANGE 4: Embed struct awrr_rq in struct rq
+ *
+ * Location: In the struct rq definition, after struct rt_rq rt;
+ *           and before struct dl_rq dl;
+ * ===================================================================== */
+
+// --- BEFORE ---
+struct rq {
+	/* ... */
+	struct cfs_rq		cfs;
+	struct rt_rq		rt;
+	struct dl_rq		dl;
+	/* ... */
+};
+
+// --- AFTER ---
+struct rq {
+	/* ... */
+	struct cfs_rq		cfs;
+	struct rt_rq		rt;
+	struct awrr_rq		awrr;	/* AWRR runqueue - between RT and DL */
+	struct dl_rq		dl;
+	/* ... */
+};
+
+
+/* =====================================================================
+ * CHANGE 5: Add AWRR runnable check helper
+ *
+ * Location: After sched_rt_runnable() or similar helpers.
+ * ===================================================================== */
+
+// --- ADD THIS NEW FUNCTION ---
+
+static inline bool sched_awrr_runnable(struct rq *rq)
+{
+	return rq->awrr.nr_running > 0;
+}

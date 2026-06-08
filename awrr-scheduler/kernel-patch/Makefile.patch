@@ -1,0 +1,21 @@
+/*
+ * Makefile.patch - Modifications to kernel/sched/Makefile
+ *
+ * Add awrr.o to the list of objects compiled into the scheduler.
+ */
+
+/* =====================================================================
+ * CHANGE 1: Add awrr.o to obj-y
+ *
+ * Location: The obj-y line in kernel/sched/Makefile
+ * ===================================================================== */
+
+# --- BEFORE ---
+obj-y := core.o fair.o rt.o deadline.o cpudeadline.o cpupri.o \
+         stop_task.o idle.o topology.o debug.o build_policy.o \
+         build_utility.o
+
+# --- AFTER ---
+obj-y := core.o fair.o rt.o deadline.o cpudeadline.o cpupri.o \
+         stop_task.o idle.o topology.o debug.o build_policy.o \
+         build_utility.o awrr.o

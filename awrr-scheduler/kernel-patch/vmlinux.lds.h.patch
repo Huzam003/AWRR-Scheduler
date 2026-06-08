@@ -1,0 +1,40 @@
+/*
+ * vmlinux.lds.h.patch - Modifications to include/asm-generic/vmlinux.lds.h
+ *
+ * Insert __awrr_sched_class between __rt_sched_class and __fair_sched_class
+ * in the SCHED_DATA linker section macro. This controls the scheduling class
+ * priority ordering: classes earlier in the list have higher priority.
+ *
+ * The for_each_class() macro iterates classes by memory address from
+ * __sched_class_highest to __sched_class_lowest. By placing AWRR between
+ * RT and FAIR, AWRR tasks are checked after RT but before CFS.
+ */
+
+/* =====================================================================
+ * CHANGE 1: Add AWRR to SCHED_DATA macro
+ *
+ * Location: The #define SCHED_DATA macro in vmlinux.lds.h
+ * ===================================================================== */
+
+// --- BEFORE ---
+#define SCHED_DATA				\
+	STRUCT_ALIGN();				\
+	__sched_class_highest = .;		\
+	*(__stop_sched_class)			\
+	*(__dl_sched_class)			\
+	*(__rt_sched_class)			\
+	*(__fair_sched_class)			\
+	*(__idle_sched_class)			\
+	__sched_class_lowest = .;
+
+// --- AFTER ---
+#define SCHED_DATA				\
+	STRUCT_ALIGN();				\
+	__sched_class_highest = .;		\
+	*(__stop_sched_class)			\
+	*(__dl_sched_class)			\
+	*(__rt_sched_class)			\
+	*(__awrr_sched_class)			\
+	*(__fair_sched_class)			\
+	*(__idle_sched_class)			\
+	__sched_class_lowest = .;

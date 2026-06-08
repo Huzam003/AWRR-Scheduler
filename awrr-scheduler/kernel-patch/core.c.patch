@@ -1,0 +1,182 @@
+/*
+ * core.c.patch - Modifications to kernel/sched/core.c
+ *
+ * This patch integrates AWRR into the core scheduler:
+ *   1. Update valid_policy() to accept SCHED_AWRR
+ *   2. Update __sched_setscheduler() to route AWRR to awrr_sched_class
+ *   3. Add init_awrr_rq() call in sched_init()
+ *   4. Update the CFS fast-path optimization in __pick_next_task()
+ *   5. Register AWRR sysctl parameters
+ */
+
+/* =====================================================================
+ * CHANGE 1: Update valid_policy()
+ *
+ * Location: In kernel/sched/core.c, the valid_policy() function.
+ * ===================================================================== */
+
+// --- BEFORE ---
+static inline int valid_policy(int policy)
+{
+	return idle_policy(policy) || fair_policy(policy) ||
+		rt_policy(policy) || dl_policy(policy);
+}
+
+// --- AFTER ---
+static inline int valid_policy(int policy)
+{
+	return idle_policy(policy) || fair_policy(policy) ||
+		rt_policy(policy) || dl_policy(policy) ||
+		awrr_policy(policy);
+}
+
+
+/* =====================================================================
+ * CHANGE 2: Update __sched_setscheduler()
+ *
+ * Location: In the __sched_setscheduler() function, where
+ *           sched_class is assigned based on policy.
+ *
+ * Find the block that sets p->sched_class based on the policy.
+ * It typically looks like a chain of if/else if conditions.
+ * ===================================================================== */
+
+// --- BEFORE ---
+/*
+ * In __sched_setscheduler(), the sched_class assignment:
+ */
+	if (dl_policy(policy))
+		p->sched_class = &dl_sched_class;
+	else if (rt_policy(policy))
+		p->sched_class = &rt_sched_class;
+	else
+		p->sched_class = &fair_sched_class;
+
+// --- AFTER ---
+	if (dl_policy(policy))
+		p->sched_class = &dl_sched_class;
+	else if (rt_policy(policy))
+		p->sched_class = &rt_sched_class;
+	else if (awrr_policy(policy))
+		p->sched_class = &awrr_sched_class;
+	else
+		p->sched_class = &fair_sched_class;
+
+
+/* =====================================================================
+ * CHANGE 3: Initialize AWRR run queue in sched_init()
+ *
+ * Location: In sched_init(), inside the for_each_possible_cpu loop
+ *           where per-CPU run queues are initialized.
+ *           Add after init_rt_rq(&rq->rt); (or similar RT init).
+ * ===================================================================== */
+
+// --- BEFORE ---
+void __init sched_init(void)
+{
+	/* ... */
+	for_each_possible_cpu(i) {
+		struct rq *rq = cpu_rq(i);
+		/* ... */
+		init_cfs_rq(&rq->cfs);
+		init_rt_rq(&rq->rt);
+		init_dl_rq(&rq->dl);
+		/* ... */
+	}
+	/* ... */
+}
+
+// --- AFTER ---
+void __init sched_init(void)
+{
+	/* ... */
+	for_each_possible_cpu(i) {
+		struct rq *rq = cpu_rq(i);
+		/* ... */
+		init_cfs_rq(&rq->cfs);
+		init_rt_rq(&rq->rt);
+		init_awrr_rq(&rq->awrr);
+		init_dl_rq(&rq->dl);
+		/* ... */
+	}
+
+	/* ... after the for_each_possible_cpu loop, register sysctls ... */
+	awrr_sysctl_init();
+	/* ... */
+}
+
+
+/* =====================================================================
+ * CHANGE 4: Update __pick_next_task() CFS optimization
+ *
+ * Location: In the __pick_next_task() function (or pick_next_task()),
+ *           there is an optimization that checks if all runnable tasks
+ *           are CFS tasks. If so, it skips the class iteration and goes
+ *           directly to CFS.
+ *
+ *           This optimization must also check for AWRR tasks.
+ * ===================================================================== */
+
+// --- BEFORE ---
+static inline struct task_struct *
+__pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	const struct sched_class *class;
+	struct task_struct *p;
+
+	/*
+	 * Optimization: if prev is CFS or lower, and all tasks are CFS,
+	 * skip straight to CFS.
+	 */
+	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+		   rq->nr_running == rq->cfs.h_nr_running)) {
+
+		p = pick_next_task_fair(rq, prev, rf);
+		/* ... */
+	}
+	/* ... generic path ... */
+}
+
+// --- AFTER ---
+static inline struct task_struct *
+__pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	const struct sched_class *class;
+	struct task_struct *p;
+
+	/*
+	 * Optimization: if prev is CFS or lower, and all tasks are CFS
+	 * (no AWRR, RT, DL tasks), skip straight to CFS.
+	 *
+	 * Must also verify no AWRR tasks are runnable.
+	 */
+	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+		   rq->nr_running == rq->cfs.h_nr_running &&
+		   !rq->awrr.nr_running)) {
+
+		p = pick_next_task_fair(rq, prev, rf);
+		/* ... */
+	}
+	/* ... generic path ... */
+}
+
+
+/* =====================================================================
+ * CHANGE 5: Handle AWRR in __setscheduler_params()
+ *
+ * Location: In __setscheduler_params(), AWRR does not use rt_priority.
+ *           Ensure the priority is set appropriately.
+ *
+ * Add after the existing handling for RT and DL policies.
+ * ===================================================================== */
+
+// --- ADD to __setscheduler_params() ---
+/*
+ * For AWRR policy, set a fixed priority just above CFS tasks.
+ * AWRR tasks run at the boundary between RT and normal priorities.
+ */
+	if (awrr_policy(policy)) {
+		p->normal_prio = MAX_RT_PRIO;	/* 100 - just below RT */
+		p->prio = p->normal_prio;
+		p->rt_priority = 0;
+	}

@@ -1,0 +1,5 @@
+# Ignore models and agents configuration folder
+.agents/
+__MACOSX/
+*.o
+awrr_setpolicy
