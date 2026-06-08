@@ -14,7 +14,7 @@ A real, working custom Linux scheduling class (`awrr_sched_class` / policy `7`) 
 ---
 
 ### 👤 Developer
-**Syed Wasif Ali Shah** (242334)  
+**Huzaifah Bin Naeem** (242298)  
 Air University NCSA  
 
 </div>
@@ -258,7 +258,7 @@ Starved processes must receive priority boosts, but permanent priority updates a
 
 ---
 
-## ⚠️ Known Limitations (Honest)
+## ⚠️ Known Limitations
 
 * **No SMP Load Balancing**: The scheduler stubs balance functions (`select_task_rq_awrr` and `balance_awrr`). Tasks remain on their parent execution core.
 * **Low Jitter Range**: Noise is clamped at 10% of the slice to preserve execution performance while mitigating timing side-channels.
